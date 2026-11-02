@@ -63,6 +63,121 @@ npm run dev        # http://localhost:3000（被占用会自动换端口）
 npm test           # 对齐 / mock / 节奏算术的单测，不联网
 ```
 
+## 用样例音频测试
+
+默认页面 `/` 会选中 `The Gettysburg Address`，对应 `scripts/examples/The Gettysburg Address.m4a`。
+
+直接运行 `npm run dev` 时，默认 `ASR_PROVIDER=mock`，不会读取音频文件；点击“开始朗读”可以测试页面、对齐和判分流程。要用样例音频测试真实 ASR：
+
+1. 在 `.env.local` 中配置 `ASR_PROVIDER=r2t2`、`R2T2_WS_URL` 和 `R2T2_LANGUAGE=English`；判分还需要配置 `JEV_API_KEY`、`JEV_ENDPOINT` 和 `JEV_MODEL`。
+2. 运行 `npm run dev`，打开首页并保持默认选中的 Gettysburg 文稿。
+3. 在另一台设备上播放 `scripts/examples/The Gettysburg Address.m4a`，把扬声器靠近运行页面设备的麦克风，然后点击“开始朗读”。页面目前使用麦克风输入，不会直接上传或读取该文件。
+4. 等音频播放结束后停止朗读并查看判分结果。线上中继单次会话最多约 30 秒；超过时长时使用自部署 R2T2，或只播放样例的前 30 秒。
+
+### 真实复现末尾的 `equal`
+
+要复现真实 ASR 的末尾词识别，不要用默认的 mock 模式：mock 不读取 `.m4a`，只按预设文本生成模拟结果。按上面的配置把 `.env.local` 设为 `ASR_PROVIDER=r2t2` 并重启开发服务，然后先打开 `http://localhost:3000/api/asr`，确认返回 JSON 中的 `provider` 是 `r2t2`。若仍是 `mock`，这次运行就没有经过真实 ASR。
+
+在浏览器开发者工具的 Network 面板勾选 Preserve log 并筛选 `score`，用另一台设备播放完整样例，播放结束后点击停止。打开 `POST /api/score` 的请求载荷，检查 `heard` 字段是否包含 `equal`：
+
+- `heard` 不含 `equal`：R2T2 没有识别出最后一个词。检查音频是否完整播放、麦克风是否收到声音，并在样例结束后再点停止；要排除环境变量 `R2T2_MAX_SECONDS` 或线上中继时长限制造成的截断。
+- `heard` 含 `equal`，但页面仍将它标为漏读：ASR 已经听到该词，问题在识别结果与参考文本的对齐或标记；保留这份请求载荷即可复现和继续排查。
+
+`JEV_API_KEY` 等判分配置只影响最终判分；检查实时识别结果时，关键是 `ASR_PROVIDER=r2t2`、可用的 R2T2 地址，以及浏览器麦克风权限。也可以使用下方的自动回放方式把音频直接送入浏览器音频流；它使用真实 R2T2，但会绕过扬声器和实体麦克风的声学链路。
+
+### 自动回放并验证正文位置
+
+需要重复验证页面是否在朗读时移动正文时，可以把样例音频直接接入浏览器的麦克风流，不依赖扬声器和实体麦克风。此方法需要已配置并运行的真实 R2T2；`ASR_PROVIDER=mock` 不会请求麦克风。部分浏览器不能直接解码 M4A，下面先用 PyAV 转成临时 WAV：
+
+```powershell
+python -m pip install av
+$env:DASHENG_TEST_WAV = Join-Path $env:TEMP "dasheng-gettysburg.wav"
+@'
+import av, os
+
+source = av.open("scripts/examples/The Gettysburg Address.m4a")
+output = av.open(os.environ["DASHENG_TEST_WAV"], "w", format="wav")
+stream = output.add_stream("pcm_s16le", rate=16000)
+stream.layout = "mono"
+resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+
+for input_frame in source.decode(audio=0):
+		for frame in resampler.resample(input_frame):
+				for packet in stream.encode(frame):
+						output.mux(packet)
+for packet in stream.encode(None):
+		output.mux(packet)
+
+output.close()
+source.close()
+print(os.environ["DASHENG_TEST_WAV"])
+'@ | python
+```
+
+在另一个 PowerShell 终端运行临时音频服务：
+
+```powershell
+node -e "const http=require('node:http'),fs=require('node:fs'),path=require('node:path');const data=fs.readFileSync(path.join(process.env.TEMP,'dasheng-gettysburg.wav'));http.createServer((req,res)=>{res.setHeader('Access-Control-Allow-Origin','*');res.setHeader('Content-Type','audio/wav');res.setHeader('Content-Length',data.length);res.end(data)}).listen(4180,'127.0.0.1',()=>console.log('Audio fixture server listening on 4180'))"
+```
+
+打开首页开发者工具的 Console，先运行下面代码，再点击“开始朗读”。音频会在页面请求麦克风时开始播放，并作为麦克风输入送入 R2T2；计时器每 200ms 记录一次正文顶部坐标：
+
+```js
+(() => {
+	const context = new AudioContext();
+	const audio = new Audio();
+	audio.crossOrigin = "anonymous";
+	audio.src = "http://localhost:4180/";
+	const source = context.createMediaElementSource(audio);
+	const destination = context.createMediaStreamDestination();
+	source.connect(destination);
+
+	navigator.mediaDevices.getUserMedia = async () => {
+		await context.resume();
+		await audio.play();
+		return destination.stream;
+	};
+
+	window.__dashengAudioReplay = { audio, context };
+	window.__dashengPassageY = [];
+	window.__dashengYTimer = setInterval(() => {
+		window.__dashengPassageY.push(
+			document.querySelector(".passage")?.getBoundingClientRect().top,
+		);
+	}, 200);
+})();
+```
+
+音频播放结束后，在 Console 查看坐标变化；`delta` 为 `0` 表示播放期间正文没有移动：
+
+```js
+clearInterval(window.__dashengYTimer);
+const positions = window.__dashengPassageY.filter(Number.isFinite);
+console.log({
+	minY: Math.min(...positions),
+	maxY: Math.max(...positions),
+	delta: Math.max(...positions) - Math.min(...positions),
+});
+```
+
+测试后停止音频服务（在对应终端按 `Ctrl+C`），并重新加载页面以恢复浏览器原有的麦克风 API。临时 WAV 位于 `%TEMP%\dasheng-gettysburg.wav`，可自行删除。
+
+## OpenLearn 待复习句子
+
+Dasheng 现有一个独立的 `/review` 页面，用来读取 OpenLearn 里“到期待复习”的句子，并保留原来的首页 demo 不变。流程是：
+
+1. 先启动 OpenLearn：在 `D:\work\OpenLearn` 目录执行 `python app.py`，默认监听 `http://127.0.0.1:5050`。
+2. 再启动 Dasheng：`npm run dev`，访问 `http://localhost:3000/review`。
+3. 在页面中输入 OpenLearn 用户名；当前 OpenLearn 允许的用户名仅为 `test` 或 `xue`。
+4. 页面会通过 Dasheng 的 `GET /api/review?username=...` 代理访问 OpenLearn 的 `GET /review_list`，只展示待复习句子，不会提交答案、更新评分或复习等级。
+5. 如果你把 OpenLearn 放在别的地址或端口，可以在 Dasheng 的 `.env.local` 里设置 `OPENLEARN_API_URL`，例如：
+
+```bash
+OPENLEARN_API_URL=http://127.0.0.1:5050
+```
+
+> 说明：OpenLearn 的 `/review_list` 会自动补齐用户的 `user_sentence` 关联记录；这一步是服务端为新用户补表，不属于 Dasheng 自己创建业务数据。Dasheng 这边只负责读取和展示，不触碰复习结果写回。
+
 `.env.local`（**不要提交**）：
 
 ```bash
@@ -74,6 +189,8 @@ ASR_PROVIDER=r2t2                                 # mock = 不用麦克风，按
 R2T2_WS_URL=wss://...                             # 见下
 R2T2_LANGUAGE=English
 ```
+
+本机 Docker 自部署时，`npm run dev` 会按 `.env.local` 的 `R2T2_*` 设置启动或复用 WebSocket 服务。可在本地配置中调整 `R2T2_DIALECT`、`R2T2_LANGUAGE`、`R2T2_SECRET_KEY`、`R2T2_GPU`、`R2T2_GPU_MEMORY_UTILIZATION`、`R2T2_MAX_MODEL_LEN`、`R2T2_MODEL_PATH`、`R2T2_VAD_MODEL_PATH`、`R2T2_PORT` 和 `R2T2_HTTP_PROXY`；修改端口时也要让 Docker 容器的端口映射与之匹配。
 
 > 变量叫 `JEV_API_KEY` 而不是 `ZENMUX_API_KEY`：机器 shell 里可能已有别的项目的
 > `ZENMUX_API_KEY`，而 shell 变量在 Next 里盖得过 `.env.local`。

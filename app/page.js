@@ -10,7 +10,7 @@ import { recordToR2T2 } from "../lib/mic.js";
 const BEST = {}; // 本次会话里每篇的最好成绩，够用，不落库
 
 export default function Page() {
-  const [passageId, setPassageId] = useState(PASSAGES[0].id);
+  const [passageId, setPassageId] = useState("gettysburg");
   const [phase, setPhase] = useState("idle"); // idle | reading | scoring | done
   const [heard, setHeard] = useState("");
   const [result, setResult] = useState(null);
@@ -272,6 +272,7 @@ export default function Page() {
         </div>
         <div className="tools">
           {phase === "done" && <button onClick={start}>再读一次</button>}
+          <a className="review-nav" href="/review">待复习句子</a>
           <span className="source">
             {phase === "reading"
               ? asr?.provider !== "r2t2"
@@ -308,26 +309,26 @@ export default function Page() {
           ))}
         </p>
 
-        {(phase === "reading" || phase === "scoring") && <div className="heard">{heard}</div>}
+        <div className={`heard ${phase === "reading" || phase === "scoring" ? "" : "quiet"}`}>
+          {heard}
+        </div>
 
-        {phase !== "idle" && (
-          <div className="legend">
+        <div className={`legend ${phase !== "idle" ? "" : "quiet"}`}>
+          <span>
+            <i style={{ background: "var(--doubt)" }} />
+            存疑
+          </span>
+          <span>
+            <i style={{ background: "var(--wrong)" }} />
+            读成了别的词
+          </span>
+          {result?.missed?.length > 0 && (
             <span>
-              <i style={{ background: "var(--doubt)" }} />
-              存疑
+              <i style={{ background: "var(--ink-4)", height: 1 }} />
+              漏读 {result.missed.length} 词
             </span>
-            <span>
-              <i style={{ background: "var(--wrong)" }} />
-              读成了别的词
-            </span>
-            {result?.missed?.length > 0 && (
-              <span>
-                <i style={{ background: "var(--ink-4)", height: 1 }} />
-                漏读 {result.missed.length} 词
-              </span>
-            )}
-          </div>
-        )}
+          )}
+        </div>
 
         {error && <div className="err">{error}</div>}
       </div>
