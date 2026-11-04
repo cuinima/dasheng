@@ -5,3 +5,6 @@ out
 .env*.local
 .DS_Store
 *.log
+# 录音调试开关产生的原始音频（样例 .m4a 是测试夹具，保留跟踪）
+scripts/examples/*.webm
+scripts/examples/*.ogg

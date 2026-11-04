@@ -3,31 +3,58 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Logo from "./Logo.js";
 import { PASSAGES } from "../lib/passages.js";
-import { align, tokenize } from "../lib/align.js";
+import { heardHasWord, liveAlign, tokenize } from "../lib/align.js";
 import { canSpeak, speak } from "../lib/speak.js";
 import { recordToR2T2 } from "../lib/mic.js";
 
 const BEST = {}; // 本次会话里每篇的最好成绩，够用，不落库
 
+async function saveRecording(blob, ext, name) {
+  try {
+    const headers = { "Content-Type": blob.type || `audio/${ext}` };
+    if (name) headers["X-Recording-Name"] = name;
+    await fetch("/api/recording", { method: "POST", headers, body: blob });
+  } catch {
+    /* 录音保存失败不影响朗读主流程 */
+  }
+}
+
 export default function Page() {
   const [passageId, setPassageId] = useState("gettysburg");
   const [phase, setPhase] = useState("idle"); // idle | reading | scoring | done
   const [heard, setHeard] = useState("");
+  const [heardView, setHeardView] = useState("");
   const [result, setResult] = useState(null);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
   const [elapsed, setElapsed] = useState(0);
   const [level, setLevel] = useState(() => new Array(14).fill(0));
   const [duration, setDuration] = useState(0);
-  const [demoAt, setDemoAt] = useState(-1); // 范读念到哪个词
+  const [demoAt, setDemoAt] = useState(-1); // 范读是否在念（>=0 表示念着）
   // 服务端不知道这台浏览器有没有语音合成，等挂载后再决定按钮出不出，免得水合不一致
   const [canDemo, setCanDemo] = useState(false);
+  // TTS 语速：0.8–1.2，默认 1，存在浏览器 localStorage 里跨会话保留
+  const [rate, setRate] = useState(() => {
+    if (typeof window === "undefined") return 1;
+    const v = Number(window.localStorage.getItem("dasheng-tts-rate"));
+    return v >= 0.8 && v <= 1.2 ? v : 1;
+  });
+  const speakStop = useRef(null);
   const stopDemo = useRef(null);
   const abort = useRef(null);
   const mic = useRef(null);
+  const retrySession = useRef(null);
   const stopRef = useRef(null);
   const stats = useRef({ durationMs: 0, pauses: 0 });
   const [asr, setAsr] = useState(null); // { provider, wsUrl, language }
+  // 调试录音开关：开启时朗读的麦克风原始音频会存到 scripts/examples 下
+  const [record, setRecord] = useState(false);
+  // 明细面板里，重读纠错的结果：{ [refIndex]: true 读对 / false 还没读对 }
+  const [retryMarks, setRetryMarks] = useState({});
+  const [retryResults, setRetryResults] = useState({});
+  // 正在重读纠错的词（面板按钮上的 loading / 麦霸状态）
+  const [retrying, setRetrying] = useState(null);
+  const [retryHeard, setRetryHeard] = useState("");
 
   // 这台机器上 ASR 是谁：mock 还是真的 R2T2
   useEffect(() => {
@@ -44,16 +71,13 @@ export default function Page() {
   const passage = useMemo(() => PASSAGES.find((p) => p.id === passageId), [passageId]);
   const words = useMemo(() => tokenize(passage.text), [passage]);
 
-  // 朗读中的划线：本地对齐先给出「读到哪、哪个词对不上」，JEV 的判决在读完后覆盖它
+  // 朗读中的划线：只拿已提交前缀、从左往右对齐。未定稿的 partial 不参与划线，
+  // 否则后面重复的词会被提前点亮，个别单词就会闪。
   const liveMarks = useMemo(() => {
     if (!heard) return { marks: [], cursor: 0 };
-    const a = align(passage.text, heard);
-    const marks = new Array(words.length).fill(null);
-    a.matched.forEach((op) => (marks[op.refIndex] = "ok"));
-    a.substitutions.forEach((s) => (marks[s.refIndex] = "doubt"));
-    const cursor = marks.reduce((acc, m, i) => (m ? i + 1 : acc), 0);
-    return { marks, cursor };
-  }, [heard, passage, words.length]);
+    const a = liveAlign(passage.text, heard);
+    return { marks: a.marks, cursor: a.cursor };
+  }, [heard, passage]);
 
   const finalMarks = result?.marks;
 
@@ -87,10 +111,17 @@ export default function Page() {
   const start = useCallback(async () => {
     setError("");
     setHeard("");
+    setHeardView("");
     setResult(null);
     setOpen(false);
     setElapsed(0);
+    setRetryMarks({});
+    setRetryResults({});
+    setRetrying(null);
+    retrySession.current?.stop();
+    retrySession.current = null;
     stopDemo.current?.();
+    speakStop.current?.();
     setPhase("reading");
     const controller = new AbortController();
     abort.current = controller;
@@ -109,12 +140,14 @@ export default function Page() {
           secretKey: asr.secretKey || "",
           onCommit: ({ committed, partial }) => {
             text = committed;
-            setHeard(partial ? `${committed} ${partial}` : committed);
+            setHeard(committed);
+            setHeardView(partial ? `${committed} ${partial}` : committed);
           },
           onLevel: (peak) => {
             const n = Math.round(Math.min(1, peak * 2.2) * 14);
             setLevel(Array.from({ length: 14 }, (_, i) => (i < n ? 6 + Math.min(1, peak * 2.2) * 16 : 6)));
           },
+          onRecording: record ? saveRecording : undefined,
         });
         mic.current = session;
         const out = await session.done;
@@ -123,6 +156,7 @@ export default function Page() {
         stats.current = { durationMs: out.durationMs, pauses: 0 };
         setDuration(out.durationMs || 0);
         setHeard(text);
+        setHeardView(text);
       } catch (err) {
         mic.current = null;
         setError(err.message);
@@ -157,11 +191,13 @@ export default function Page() {
             if (e.type === "word") {
               text = text ? `${text} ${e.text}` : e.text;
               setHeard(text);
+              setHeardView(text);
             } else if (e.type === "done") {
               text = e.heard || text;
               stats.current = { durationMs: e.durationMs, pauses: e.pauses };
               setDuration(e.durationMs || 0);
               setHeard(text);
+              setHeardView(text);
             }
           }
         }
@@ -201,10 +237,10 @@ export default function Page() {
       setError(err.message);
       setPhase("idle");
     }
-  }, [passageId, passage, elapsed, asr]);
+  }, [passageId, passage, elapsed, asr, record]);
 
   // 停：真麦克风是「说完了」（送 EOS 等最后一版），mock 是掐断流
-  // 范读：听一遍再读。念到哪个词就高亮哪个词。
+  // 范读：听一遍再读。用有道 TTS 整段念，不加逐词高亮（有道只回音频，不回字符边界）。
   const playDemo = useCallback(() => {
     if (stopDemo.current) {
       stopDemo.current();
@@ -214,25 +250,94 @@ export default function Page() {
     }
     setDemoAt(0);
     stopDemo.current = speak(passage.text, {
-      onWord: (charIndex) => {
-        const i = words.findIndex((w) => charIndex >= w.start && charIndex < w.end);
-        if (i >= 0) setDemoAt(i);
-      },
+      rate,
       onEnd: () => {
         stopDemo.current = null;
         setDemoAt(-1);
       },
     });
-  }, [passage, words]);
+  }, [passage, rate]);
+
+  // 点击范文里的某个单词，单独听这个词（也用有道 TTS）
+  const playWord = useCallback((word) => {
+    speakStop.current?.();
+    speakStop.current = speak(word, { rate });
+  }, [rate]);
+
+  const setRatePersist = useCallback((next) => {
+    const v = Math.max(0.8, Math.min(1.2, Number(next) || 1));
+    setRate(v);
+    try {
+      window.localStorage.setItem("dasheng-tts-rate", String(v));
+    } catch {
+      /* 隐私模式等场景 localStorage 不可用，忽略 */
+    }
+  }, []);
 
   useEffect(() => {
     setCanDemo(canSpeak());
-    return () => stopDemo.current?.();
+    return () => {
+      stopDemo.current?.();
+      speakStop.current?.();
+    };
   }, []);
 
   const stop = useCallback(() => {
     if (mic.current) mic.current.stop();
     else abort.current?.abort();
+  }, []);
+
+  // 重读纠错：点明细里某个词右边的「重读」，再念一遍这个词，R2T2 听到后
+  // 判断这次有没有读对。只做「是不是同一个词」的文本比对，不打分。
+  const retryWord = useCallback(
+    async (word, refIndex) => {
+      if (retrying != null) return;
+      if (!asr?.wsUrl) {
+        setError("R2T2 未配置，无法重读纠错");
+        return;
+      }
+      setError("");
+      setRetrying(refIndex);
+      setRetryHeard("");
+      let recognized = "";
+      try {
+        const session = await recordToR2T2({
+          wsUrl: asr.wsUrl,
+          dialect: asr.dialect || "relay",
+          language: asr.language || "English",
+          secretKey: asr.secretKey || "",
+          onCommit: ({ committed, partial }) => {
+            recognized = partial ? `${committed} ${partial}`.trim() : committed;
+            setRetryHeard(recognized);
+          },
+          shouldFinish: ({ committed, partial }) => heardHasWord(`${committed} ${partial}`, word),
+          onRecording: record ? (blob, ext) => saveRecording(blob, ext, word) : undefined,
+          onLevel: (peak) => {
+            const n = Math.round(Math.min(1, peak * 2.2) * 14);
+            setLevel(Array.from({ length: 14 }, (_, i) => (i < n ? 6 + Math.min(1, peak * 2.2) * 16 : 6)));
+          },
+        });
+        retrySession.current = session;
+        const out = await session.done;
+        retrySession.current = null;
+        recognized = out.heard || recognized;
+        setRetryHeard(recognized);
+        setRetryResults((results) => ({ ...results, [refIndex]: recognized }));
+        const ok = heardHasWord(recognized, word);
+        setRetryMarks((m) => ({ ...m, [refIndex]: ok }));
+      } catch (err) {
+        retrySession.current = null;
+        if (recognized) setRetryResults((results) => ({ ...results, [refIndex]: recognized }));
+        if (err.name !== "AbortError") setError(err.message);
+      } finally {
+        setRetrying(null);
+      }
+    },
+    [asr, record, retrying],
+  );
+
+  const stopRetry = useCallback(() => {
+    if (retrySession.current) retrySession.current.stop();
   }, []);
 
   useEffect(() => {
@@ -253,12 +358,17 @@ export default function Page() {
   const pick = (id) => {
     if (phase === "reading" || phase === "scoring") return;
     stopDemo.current?.();
+    speakStop.current?.();
     setDemoAt(-1);
     setPassageId(id);
     setPhase("idle");
     setHeard("");
+    setHeardView("");
     setResult(null);
     setOpen(false);
+    setRetryMarks({});
+    setRetryResults({});
+    setRetrying(null);
   };
 
   return (
@@ -303,14 +413,20 @@ export default function Page() {
         <p className={`passage ${phase === "idle" ? "idle" : ""} ${phase === "done" ? "done" : ""}`}>
           {words.map((w, i) => (
             <span key={i}>
-              <span className={`w ${wordClass({ i, phase, finalMarks, live: liveMarks, demoAt })}`}>{w.raw}</span>
+              <span
+                className={`w ${wordClass({ i, phase, finalMarks, live: liveMarks, retryMarks })}`}
+                onClick={() => playWord(w.raw)}
+                title="点击听这个单词"
+              >
+                {w.raw}
+              </span>
               {tail(passage.text, words, i)}
             </span>
           ))}
         </p>
 
-        <div className={`heard ${phase === "reading" || phase === "scoring" ? "" : "quiet"}`}>
-          {heard}
+        <div className={`heard ${phase === "reading" || phase === "scoring" ? "" : "quiet"} ${asr?.provider === "r2t2" ? "quiet" : ""}`}>
+          {heardView || heard}
         </div>
 
         <div className={`legend ${phase !== "idle" ? "" : "quiet"}`}>
@@ -319,12 +435,12 @@ export default function Page() {
             存疑
           </span>
           <span>
-            <i style={{ background: "var(--wrong)" }} />
+            <i style={{ background: "var(--ink)" }} />
             读成了别的词
           </span>
           {result?.missed?.length > 0 && (
             <span>
-              <i style={{ background: "var(--ink-4)", height: 1 }} />
+              <i style={{ background: "var(--ink)", height: 1 }} />
               漏读 {result.missed.length} 词
             </span>
           )}
@@ -332,6 +448,24 @@ export default function Page() {
 
         {error && <div className="err">{error}</div>}
       </div>
+
+      {asr?.provider === "r2t2" &&
+        (phase === "reading" || phase === "scoring" || (open && (retrying !== null || retryHeard))) && (
+        <div className={`heard-overlay ${retrying !== null || (open && retryHeard) ? "retry-live" : ""}`} aria-label="R2T2 识别文本">
+          {retrying !== null || (open && retryHeard) ? (
+            <>
+              <div className="heard-compare-line">
+                <span className="heard-label">全文</span>
+                <span className="heard-value">{heard || "—"}</span>
+              </div>
+              <div className="heard-compare-line">
+                <span className="heard-label">重读</span>
+                <span className="heard-value">{retryHeard || "等待识别…"}</span>
+              </div>
+            </>
+          ) : heardView || heard}
+        </div>
+      )}
 
       <div className="rail">
         <div className="side">
@@ -370,6 +504,20 @@ export default function Page() {
                   </button>
                 )}
               </div>
+              {canDemo && (
+                <label className="rate">
+                  <span>语速</span>
+                  <input
+                    type="range"
+                    min="0.8"
+                    max="1.2"
+                    step="0.05"
+                    value={rate}
+                    onChange={(e) => setRatePersist(e.target.value)}
+                  />
+                  <span className="rate-v">{rate.toFixed(2)}×</span>
+                </label>
+              )}
               <span className="hint">按 SPACE 开始 · 音频不落盘</span>
             </>
           )}
@@ -434,23 +582,47 @@ export default function Page() {
         </button>
       </div>
 
-      {open && result && <Sheet result={result} onClose={() => setOpen(false)} onAgain={start} />}
+      {open && result && (
+        <div className="sheet-dismiss" onClick={() => setOpen(false)}>
+          <Sheet
+            result={result}
+            onClose={() => setOpen(false)}
+            onAgain={start}
+            onPlayWord={playWord}
+            onRetryWord={retryWord}
+            onStopRetry={stopRetry}
+            retryMarks={retryMarks}
+            retryResults={retryResults}
+            retrying={retrying}
+            retryHeard={retryHeard}
+          />
+        </div>
+      )}
+
+      <label className={`rec-toggle ${record ? "on" : ""}`} title="开启后，全文录音按时间保存，单词重读按词名保存到 scripts/examples 下">
+        <input
+          type="checkbox"
+          checked={record}
+          onChange={(e) => setRecord(e.target.checked)}
+        />
+        <span className="rec-dot" />
+        <span className="rec-label">录音</span>
+      </label>
     </div>
   );
 }
 
-function Sheet({ result, onClose, onAgain }) {
+function Sheet({ result, onClose, onAgain, onPlayWord, onRetryWord, onStopRetry, retryMarks, retryResults, retrying, retryHeard }) {
+  // 判错的（读成别的词 / 存疑）一行一个；漏读的每个词也单独一行，都可点击重听。
   const rows = [
     ...result.verdicts
       .filter((v) => v.status !== "ok")
-      .map((v) => ({ from: v.word, to: v.heard, status: v.status })),
-    ...(result.missed.length
-      ? [{ from: `${result.missed[0].word} …`, to: `漏读 ${result.missed.length} 词`, status: "missed" }]
-      : []),
-  ].slice(0, 4);
+      .map((v) => ({ from: v.word, to: v.heard, status: v.status, refIndex: v.refIndex })),
+    ...result.missed.map((m) => ({ from: m.word, to: "漏读", status: "missed", refIndex: m.refIndex })),
+  ].sort((a, b) => a.refIndex - b.refIndex);
 
   return (
-    <div className="sheet" role="dialog" aria-label="成绩明细">
+    <div className="sheet" role="dialog" aria-label="成绩明细" onClick={(event) => event.stopPropagation()}>
       <span className="handle" />
       <div className="top">
         <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
@@ -466,18 +638,46 @@ function Sheet({ result, onClose, onAgain }) {
       </div>
 
       <div className="diffs">
-        {rows.length === 0 && <div className="diff"><span className="to">没有可看的差异 — 全读对了</span></div>}
+        {rows.length === 0 && <div className="diff-empty">没有可看的差异 — 全读对了</div>}
         {rows.map((r, i) => (
           <div className="diff" key={i}>
-            <span className={`from ${r.status}`}>{r.from}</span>
-            <span className="arrow">→</span>
-            <span className="to">{r.to}</span>
+            <div className="diff-main">
+              <button
+                className={`from ${retryMarks[r.refIndex] === true ? "ok" : r.status}`}
+                onClick={() => onPlayWord(r.from)}
+                title="点击重听这个单词"
+              >
+                {r.from}
+              </button>
+              <span className="arrow">→</span>
+              <span className="to">{r.to}</span>
+            </div>
+            <div className="diff-actions">
+              {retryMarks[r.refIndex] === true ? (
+                <span className="retry-result" role="status">已读对</span>
+              ) : (
+                <button
+                  className={`retry ${retryMarks[r.refIndex] === false ? "no" : ""}`}
+                  onClick={() => (retrying === r.refIndex ? onStopRetry() : onRetryWord(r.from, r.refIndex))}
+                  title="重读这个词，R2T2 判断这次有没有读对"
+                >
+                  {retrying === r.refIndex ? "停止" : retryMarks[r.refIndex] === false ? "再试一次" : "重读"}
+                </button>
+              )}
+              {(retrying === r.refIndex || typeof retryResults[r.refIndex] === "string") && (
+                <span className="retry-heard" aria-live={retrying === r.refIndex ? "polite" : undefined}>
+                  {retrying === r.refIndex
+                    ? retryHeard || "等待识别…"
+                    : retryResults[r.refIndex] || "未识别到文本"}
+                </span>
+              )}
+            </div>
           </div>
         ))}
       </div>
 
       <div className="foot">
-        <span className="source">JEV 判词 · 时间戳算节奏 · 不评发音</span>
+        <span className="source">JEV 判词 · 时间戳算节奏 · 不评发音 · 点击单词可重听</span>
         <div className="acts">
           <button onClick={onClose}>收起</button>
           <button className="primary" onClick={onAgain}>
@@ -503,8 +703,9 @@ function Sub({ k, v, pct }) {
   );
 }
 
-function wordClass({ i, phase, finalMarks, live, demoAt }) {
-  if (phase === "idle") return i === demoAt ? "demo" : "";
+function wordClass({ i, phase, finalMarks, live, retryMarks }) {
+  if (phase === "idle") return "";
+  if (retryMarks?.[i] === true) return "ok";
   if (finalMarks) return finalMarks[i]?.status || "missed";
   const m = live.marks[i];
   if (m) return m;

@@ -22,6 +22,11 @@
 念的时候字是一个个亮起来的，念错的当场标红，念完点一下出总分。
 一台 12GB 的卡就够。
 
+朗读时屏幕底部有一条 R2T2 实时识别字幕（真 R2T2 才显示，mock 不显示）：32px 字号、
+居中偏下（`bottom: 25%`），容器宽约屏宽的 30%、左右各留 35% 空白，避免贴边被裁切。
+字幕采用「右缘锚定 + 向左滚动」：最新识别的词始终贴在右缘可见，旧词往左溢出屏外被裁，
+优先展示最近结果，不再用省略号截断。
+
 ## 两个模型，各干各的
 
 **R2T2 负责听。** 它是真流式，最低 160ms 的步长往外吐词，还有个叫
@@ -162,6 +167,35 @@ console.log({
 
 测试后停止音频服务（在对应终端按 `Ctrl+C`），并重新加载页面以恢复浏览器原有的麦克风 API。临时 WAV 位于 `%TEMP%\dasheng-gettysburg.wav`，可自行删除。
 
+### 用 TTS 模拟正确重读
+
+完成上面的样例全文回放并进入成绩页后，打开“明细”。确认 `/api/asr` 返回的 `provider` 是 `r2t2`，且 R2T2 服务仍在运行。在浏览器开发者工具的 Console 运行下面代码，将重读时的虚拟麦克风输入切换为 `/api/tts` 返回的音频：
+
+```js
+(() => {
+	const text = "Four score and seven years ago";
+	const context = new AudioContext();
+	const audio = new Audio();
+	audio.crossOrigin = "anonymous";
+	audio.src = `/api/tts?lan=en&text=${encodeURIComponent(text)}`;
+	const source = context.createMediaElementSource(audio);
+	const destination = context.createMediaStreamDestination();
+	source.connect(destination);
+
+	navigator.mediaDevices.getUserMedia = async () => {
+		await context.resume();
+		await audio.play();
+		return destination.stream;
+	};
+	audio.addEventListener("ended", () => console.info("TTS 播放完成"), { once: true });
+	window.__dashengTtsReplay = { audio, context };
+})();
+```
+
+然后点击明细中 `score` 这一行的“重读”。TTS 播放完成后手动点击该行出现的“停止”；如果 R2T2 已识别到目标词，会话也可能在短暂等待定稿后自动结束。成功时，`score` 会变为正确样式，行尾显示不可点击的“已读对”，不再有“重读/再试一次”按钮；识别不匹配时会显示“再试一次”。
+
+注意：单独合成一个很短的词时，R2T2 可能只识别出前一个音节或没有提交结果。使用包含目标词的自然短句更稳定；`Four score and seven years ago` 中的额外词不会影响纠错，判断只要求识别结果中包含与目标相同的词。测试后重新加载页面即可恢复浏览器原有的麦克风 API；TTS 重读不依赖上面的 4180 样例音频服务。
+
 ## OpenLearn 待复习句子
 
 Dasheng 现有一个独立的 `/review` 页面，用来读取 OpenLearn 里“到期待复习”的句子，并保留原来的首页 demo 不变。流程是：
@@ -219,10 +253,31 @@ secret_key、浏览器采音与离线跑 wav 的两处差异——都在 **[docs
 
 ```
 app/page.js   待读 → 朗读中 → 判词中 → 读完（总分钮 → 明细面板）
-app/api/      asr：mock 的 SSE 流 / r2t2 的中继地址 · score：一次判分
+app/api/      asr：mock 的 SSE 流 / r2t2 的中继地址 · score：一次判分 · tts：百度 TTS 代理 · recording：调试录音保存
 lib/align.js  词级对齐 —— 决定哪些词值得问 Jev
 lib/jev.js    ZenMux System One 客户端（含代理兜底）
 lib/score.js  问题构造、判决解析、四项子分与总分
 lib/asr.js    provider：mock / r2t2（WebSocket + PCM16）
-lib/mic.js    浏览器采音与重采样 · lib/speak.js 范读与逐词高亮
+lib/mic.js    浏览器采音、重采样与调试录音 · lib/speak.js 百度 TTS 范读与单词发音
 ```
+
+范读与单词发音走百度免费 TTS（`https://sensearch.baidu.com/gettts`，即 OpenLearn 的
+`WORD_AUDIO_API_URL`），经本服务 `/api/tts` 代理转发，不再依赖浏览器 `speechSynthesis`。
+语速用 `<audio>.playbackRate` 控制，范围 0.8–1.2、默认 1，存在浏览器 `localStorage`
+（`dasheng-tts-rate`）跨会话保留。点击范文里的单词即可单独听音；读完点开明细后，
+判错/漏读的单词同样可点一下重听。
+
+读完点开明细面板，判错和漏读的单词居中显示，颜色统一为高亮黑色（正文里也一致），
+突出「这里要纠正」。每个差异词右侧有一个「重读」按钮：点它再对着麦克风念一遍这个词，
+R2T2 实时听，听到的词里若含目标词（忽略大小写、撇号）即标「已读对」，否则标「再试一次」；
+重读过程中可随时「停止」。这一步只做文本层面的「是不是同一个词」，不评发音、不打分。
+mock 模式下没有 R2T2 地址，无法重读纠错。
+
+## 录音调试
+
+页面右下角有一个「录音」开关。打开后，全文朗读和明细中的单词重读都会用浏览器
+`MediaRecorder` 采集麦克风原始音频为 webm/ogg（opus），并经 `POST /api/recording`
+保存到 `scripts/examples/`：全文录音按时间戳命名（如 `recording-2026-11-02T153000Z.webm`），
+单词重读使用单词名（如 `score.webm`）；同名文件已存在时会追加序号，避免覆盖。
+这便于拿真实音频重放、复现判分 bug，省去每次手动录一段再喂给 ASR。录音保存失败会静默忽略，
+不影响朗读主流程；开关状态不持久化，刷新页面即复位。
